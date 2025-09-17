@@ -1,0 +1,26 @@
+{
+  "name": "troofai-hybrid-mvp",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview --port 5173",
+    "hub": "node hub_server.js",
+    "service": "node troofai_service.js",
+    "zoom-auth": "node zoom_auth_server.js",
+    "enroll": "node enroll_api.js"
+  },
+  "dependencies": {
+    "dotenv": "^17.2.2",
+    "express": "^4.21.2",
+    "jsonwebtoken": "^9.0.2",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-router-dom": "^6.26.1",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "vite": "^5.4.0"
+  }
+}

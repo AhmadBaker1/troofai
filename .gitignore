@@ -1,0 +1,35 @@
+# OS/editor
+.DS_Store
+Thumbs.db
+*.swp
+.vscode/
+.idea/
+
+# Dependencies & builds
+node_modules/
+frontend/node_modules/
+dist/
+frontend/dist/
+coverage/
+*.log
+npm-debug.log*
+
+# Local env & secrets
+.env
+.env.*
+frontend/.env
+frontend/.env.*
+!.env.example
+!frontend/.env.example
+
+# Runtime state (NEVER commit)
+keys.json
+hub_state.json
+enrollments.json
+
+# Local crypto keys (demo TPM/SE)
+service_key.pem
+service_pub.pem
+
+# Misc cache
+.cache/
