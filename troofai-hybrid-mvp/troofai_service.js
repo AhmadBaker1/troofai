@@ -1,3 +1,4 @@
+// troofai_service.js
 import http from 'http';
 import fs from 'fs';
 import crypto from 'crypto';
@@ -15,17 +16,20 @@ function ensureKeys() {
 }
 function getPriv() { return crypto.createPrivateKey(fs.readFileSync(KEY_PATH)); }
 function getPub() { return fs.readFileSync(PUB_PATH, 'utf8'); }
-function keyFingerprint(pem) {
-  const der = Buffer.from(pem.replace(/-----[^-]+-----/g,'').replace(/\s+/g,''), 'base64');
-  return crypto.createHash('sha256').update(der).digest('hex').slice(0,16);
-}
-
-// Simulated “golden state” (PCR-like) for demo integrity signal
-const GOLDEN = crypto.createHash('sha256')
-  .update(JSON.stringify({ plat: os.platform(), arch: os.arch(), node: process.versions.node }))
-  .digest('hex');
 
 ensureKeys();
+
+// Create a stable "device state" hash (demo only)
+function getDemoQuote() {
+  const fingerprint = [
+    os.platform(),
+    os.arch(),
+    process.versions.node,
+    crypto.createHash('sha256').update(getPub()).digest('hex').slice(0, 16) // tie to this key
+  ].join('|');
+
+  return crypto.createHash('sha256').update(fingerprint).digest('hex'); // 64 hex chars
+}
 
 function json(res, code, obj) {
   res.writeHead(code, {
@@ -35,6 +39,7 @@ function json(res, code, obj) {
   });
   res.end(JSON.stringify(obj));
 }
+
 function parseBody(req) {
   return new Promise((resolve) => {
     let d = '';
@@ -44,24 +49,24 @@ function parseBody(req) {
 }
 
 const server = http.createServer(async (req, res) => {
-  if (req.method === 'OPTIONS') { res.writeHead(204, { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': '*' }); return res.end(); }
+  if (req.method === 'OPTIONS') { 
+    res.writeHead(204, { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': '*' }); 
+    return res.end(); 
+  }
 
   if (req.url === '/health') return json(res, 200, { ok: true });
-  if (req.url === '/pubkey') {
-    const pem = getPub();
-    return json(res, 200, { pem, keyId: keyFingerprint(pem), alg: 'ES256', golden: GOLDEN });
-  }
+  if (req.url === '/pubkey') return json(res, 200, { pem: getPub() });
+  if (req.url === '/quote') return json(res, 200, { quote: getDemoQuote() });
 
   if (req.url === '/sign' && req.method === 'POST') {
     const body = await parseBody(req);
     const canonical = body.canonical || '';
     try {
       const signer = crypto.createSign('SHA256');
-      signer.update(Buffer.from(canonical, 'utf8')); signer.end();
+      signer.update(Buffer.from(canonical, 'utf8'));
+      signer.end();
       const sigDer = signer.sign(getPriv()); // DER-encoded ECDSA
-      const pem = getPub();
-      const keyId = keyFingerprint(pem);
-      return json(res, 200, { sigHex: sigDer.toString('hex'), keyId, alg: 'ES256' });
+      return json(res, 200, { sigHex: sigDer.toString('hex') });
     } catch (e) {
       return json(res, 500, { error: e.message });
     }

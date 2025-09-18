@@ -1,9 +1,10 @@
+// frontend/src/pages/Admin.jsx
 import React, { useEffect, useRef, useState } from 'react';
 
 const DETECT_WINDOW_MS = 1400;
 const AUTO_VERIFY_DELAY_MS = 250;
 
-// DER ECDSA → raw r||s (P-256)
+// DER ECDSA -> raw r|s (64B) for WebCrypto verify
 function derToRaw(derHex) {
   const b = Uint8Array.from(derHex.match(/.{1,2}/g).map(h => parseInt(h, 16)));
   let i = 0; if (b[i++] !== 0x30) throw new Error('Bad DER');
@@ -18,20 +19,30 @@ function derToRaw(derHex) {
 
 export default function Admin() {
   const [wsState, setWsState] = useState('Disconnected');
-  const [participants, setParticipants] = useState(new Map()); // pid -> participant
+  const [participants, setParticipants] = useState(new Map());   // id -> participant
   const participantsRef = useRef(new Map());
 
   const [meetingId, setMeetingId] = useState('mtg-123');
   const meetingIdRef = useRef(meetingId);
   useEffect(()=>{ meetingIdRef.current = meetingId; }, [meetingId]);
 
-  // displayName (lower) -> { displayName, participantId? }
+  // displayName(lower) -> { displayName, participantId? }
   const [meetingRoster, setMeetingRoster] = useState(new Map());
+  const meetingRosterRef = useRef(new Map()); // 👈 live ref to fix stale reads
+
   const wsRef = useRef(null);
 
+  // Auto-verify toggles
   const [autoVerifyOnJoin, setAutoVerifyOnJoin] = useState(true);
   const lastAutoRef = useRef(new Map());
   const autoTimersRef = useRef(new Map());
+
+  // "Golden" baseline quotes (pid -> hex). Learn-on-first-good (demo).
+  const baselineQuotesRef = useRef(new Map());
+
+  // Name-level timers/status for unbound attendees (no enrolled device)
+  const nameStatusesRef = useRef(new Map());   // dnLower -> { statusText, statusLevel }
+  const nameTimersRef   = useRef(new Map());   // dnLower -> timeout id
 
   const randNonce = (len=3) => [...crypto.getRandomValues(new Uint8Array(len))].map(b=>b.toString(16).padStart(2,'0')).join('').toUpperCase();
 
@@ -48,6 +59,28 @@ export default function Admin() {
       sendVerify(pid);
     }, AUTO_VERIFY_DELAY_MS);
     autoTimersRef.current.set(pid, tid);
+  }
+
+  // For name-only attendees (no bound device), mark Untrusted after TTL
+  function scheduleNameNoDeviceVerdict(displayName) {
+    const key = (displayName || '').toLowerCase();
+    if (!key) return;
+
+    const old = nameTimersRef.current.get(key);
+    if (old) clearTimeout(old);
+
+    const tid = setTimeout(() => {
+      // ✅ read the CURRENT roster from the ref (not stale state)
+      const entry = meetingRosterRef.current.get(key);
+      const stillUnbound = entry && !entry.participantId;
+      if (stillUnbound) {
+        nameStatusesRef.current.set(key, { statusText: 'Untrusted (no enrolled device)', statusLevel: 'bad' });
+        // force a re-render (participants map change is enough)
+        setParticipants(prev => new Map(prev));
+      }
+    }, DETECT_WINDOW_MS + 300);
+
+    nameTimersRef.current.set(key, tid);
   }
 
   const setStatus = (p, text, level) => {
@@ -133,7 +166,8 @@ export default function Admin() {
       timedOut = age > DETECT_WINDOW_MS;
     }
 
-    const canonical = `${sc.meetingId || ''}|${p.id}|${sc.challengeId || ''}|${sc.n}|${sc.ts}|${sc.pattern}`;
+    // include quote at the end (must match Companion)
+    const canonical = `${sc.meetingId || ''}|${p.id}|${sc.challengeId || ''}|${sc.n}|${sc.ts}|${sc.pattern}|${sc.quote || ''}`;
 
     try {
       const ok = await crypto.subtle.verify(
@@ -143,10 +177,21 @@ export default function Admin() {
         new TextEncoder().encode(canonical)
       );
 
-      if (ok && !timedOut) { setStatus(p, 'Trusted (sig ok)', 'ok'); bumpRisk(p, true); }
-      else if (ok && timedOut) { setStatus(p, 'Untrusted (timeout)', 'bad'); bumpRisk(p, false); }
-      else { setStatus(p, 'Untrusted (bad sig)', 'bad'); bumpRisk(p, false); }
-    } catch {
+      // attestation baseline check (learn-on-first-good behavior)
+      let attestationOk = true;
+      const b = baselineQuotesRef.current.get(p.id);
+      if (!b && sc.quote && ok && !timedOut) {
+        baselineQuotesRef.current.set(p.id, sc.quote);
+      } else if (b && sc.quote) {
+        attestationOk = (b === sc.quote);
+      }
+
+      if (ok && attestationOk && !timedOut) { setStatus(p, 'Trusted (sig+att ok)', 'ok'); bumpRisk(p, true); }
+      else if (ok && !attestationOk)       { setStatus(p, 'Untrusted (attestation changed)', 'bad'); bumpRisk(p, false); }
+      else if (ok && timedOut)             { setStatus(p, 'Untrusted (timeout)', 'bad'); bumpRisk(p, false); }
+      else                                 { setStatus(p, 'Untrusted (bad sig)', 'bad'); bumpRisk(p, false); }
+    } catch (e) {
+      console.error('[Admin] verify error', e);
       setStatus(p, 'Untrusted (verify err)', 'bad'); bumpRisk(p, false);
     }
     p.pending = null;
@@ -178,10 +223,7 @@ export default function Admin() {
   // ----- WS -----
   useEffect(() => {
     const ws = new WebSocket(import.meta.env.VITE_HUB_URL || 'ws://127.0.0.1:8080'); wsRef.current = ws;
-    ws.onopen = () => {
-      setWsState('Connected');
-      ws.send(JSON.stringify({ type:'role', role:'verifier' }));
-    };
+    ws.onopen = () => { setWsState('Connected'); ws.send(JSON.stringify({ type:'role', role:'verifier' })); };
     ws.onclose = () => setWsState('Disconnected');
     ws.onmessage = (ev) => {
       let msg; try { msg = JSON.parse(ev.data); } catch { return; }
@@ -203,20 +245,30 @@ export default function Admin() {
         for (const r of msg.roster) {
           const dnLower = (r.displayName || '').toLowerCase();
           m.set(dnLower, { displayName: r.displayName || '' , participantId: r.participantId || null, present: true });
-          if (!r.participantId && r.displayName) setTimeout(() => verifyByDisplayName(r.displayName), 200); // blind challenge → Unverified if no key
+
+          // If not bound to a device, schedule local "no enrolled device" verdict
+          if (!r.participantId && r.displayName) scheduleNameNoDeviceVerdict(r.displayName);
         }
         setMeetingRoster(m);
+        meetingRosterRef.current = m; // 👈 keep ref in sync
       }
 
       if (msg.type === 'meeting_presence') {
-        setMeetingRoster(prev => {
-          const np = new Map(prev);
-          const key = (msg.displayName||'').toLowerCase();
-          const entry = np.get(key) || { displayName:key, present:true };
-          entry.participantId = msg.participantId;
-          np.set(key, entry);
-          return np;
-        });
+        // Build the new map first so we can update both state and ref consistently
+        const np = new Map(meetingRosterRef.current);
+        const key = (msg.displayName||'').toLowerCase();
+        const entry = np.get(key) || { displayName:key, present:true };
+        entry.participantId = msg.participantId;
+        np.set(key, entry);
+        setMeetingRoster(np);
+        meetingRosterRef.current = np; // 👈 keep ref in sync
+
+        // Binding happened: cancel any pending "no device" timer & clear local red badge
+        const t = nameTimersRef.current.get(key);
+        if (t) clearTimeout(t);
+        nameTimersRef.current.delete(key);
+        nameStatusesRef.current.delete(key);
+
         if (msg.participantId) scheduleAutoVerifyByPid(msg.participantId);
       }
 
@@ -233,10 +285,18 @@ export default function Admin() {
   const rosterItems = [...meetingRoster.values()].map(r => {
     const pid = r.participantId; const p = pid ? participants.get(pid) : null;
     const present = true;
-    const statusText = p?.statusText || (p?.hasKey ? 'Enrolled' : 'Present (no key)');
-    const statusLevel = p?.statusLevel || (p?.hasKey ? 'neutral' : 'warn');
+
+    const nameStatus = nameStatusesRef.current.get((r.displayName||'').toLowerCase());
+    const statusText = pid
+      ? (p?.statusText || (p?.hasKey ? 'Enrolled' : 'Present (no key)'))
+      : (nameStatus?.statusText || 'Present (no key)');
+    const statusLevel = pid
+      ? (p?.statusLevel || (p?.hasKey ? 'neutral' : 'warn'))
+      : (nameStatus?.statusLevel || 'warn');
+
     return { displayName: r.displayName, pid, p, present, statusText, statusLevel };
   });
+
   const totalPresent    = rosterItems.filter(x => x.present).length;
   const totalTrusted    = rosterItems.filter(x => x.p && x.p.statusLevel === 'ok').length;
   const totalUnverified = rosterItems.filter(x => x.present && (!x.p || x.p.statusLevel !== 'ok')).length;
