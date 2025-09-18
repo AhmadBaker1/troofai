@@ -1,0 +1,13 @@
+{
+  "devices": [
+    {
+      "corporateEmail": "maya.ciso@company.com",
+      "participantId": "acme:ciso",
+      "displayName": "TroofAIDemo",
+      "keyId": "258bcf1a3393",
+      "deviceId": "demo-13c644bf",
+      "pubkeyPem": "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEfePmB++nKRXYSNk8M9kZLNvr6q7U\nRgnFVrcSYPojM3893fBqqHP/K86Xo3n+pha9K9xeRjOkzm1SqqDkArcIGA==\n-----END PUBLIC KEY-----\n",
+      "enrolledAt": 1758163558063
+    }
+  ]
+}
