@@ -56,6 +56,10 @@ export default function Companion() {
 
     ws.onmessage = (ev) => {
       let msg; try { msg = JSON.parse(ev.data); } catch { return; }
+      if (msg.type === 'meeting_context' && msg.meetingId) {
+        push('Meeting context updated from Zoom: ' + msg.meetingId);
+        setMeetingId(String(msg.meetingId));
+    }
       if (msg.type === 'verify_now' && msg.participantId === id) {
         const v = msg.payload;
         push(`VERIFY n=${v.n} pat=${v.pattern} mtg=${v.meetingId}`);

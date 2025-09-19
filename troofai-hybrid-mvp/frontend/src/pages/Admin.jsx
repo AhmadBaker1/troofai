@@ -1,10 +1,8 @@
-// frontend/src/pages/Admin.jsx
 import React, { useEffect, useRef, useState } from 'react';
 
 const DETECT_WINDOW_MS = 1400;
 const AUTO_VERIFY_DELAY_MS = 250;
 
-// DER ECDSA -> raw r|s (64B) for WebCrypto verify
 function derToRaw(derHex) {
   const b = Uint8Array.from(derHex.match(/.{1,2}/g).map(h => parseInt(h, 16)));
   let i = 0; if (b[i++] !== 0x30) throw new Error('Bad DER');
@@ -26,63 +24,27 @@ export default function Admin() {
   const meetingIdRef = useRef(meetingId);
   useEffect(()=>{ meetingIdRef.current = meetingId; }, [meetingId]);
 
-  // displayName(lower) -> { displayName, participantId? }
-  const [meetingRoster, setMeetingRoster] = useState(new Map());
-  const meetingRosterRef = useRef(new Map()); // 👈 live ref to fix stale reads
+  // Display-name roster (from Zoom bridge)
+  const [meetingRoster, setMeetingRoster] = useState(new Map()); // dnLower -> { displayName, participantId? , present:true }
+  const meetingRosterRef = useRef(new Map());
 
   const wsRef = useRef(null);
 
-  // Auto-verify toggles
+  // Auto-verify
   const [autoVerifyOnJoin, setAutoVerifyOnJoin] = useState(true);
-  const lastAutoRef = useRef(new Map());
-  const autoTimersRef = useRef(new Map());
+  const lastAutoRef = useRef(new Map());    // pid -> ts
+  const autoTimersRef = useRef(new Map());  // pid -> timer
 
-  // "Golden" baseline quotes (pid -> hex). Learn-on-first-good (demo).
-  const baselineQuotesRef = useRef(new Map());
+  // Golden quote baseline
+  const baselineQuotesRef = useRef(new Map()); // pid -> hex
 
-  // Name-level timers/status for unbound attendees (no enrolled device)
-  const nameStatusesRef = useRef(new Map());   // dnLower -> { statusText, statusLevel }
-  const nameTimersRef   = useRef(new Map());   // dnLower -> timeout id
+  // For attendees with no bound device (no participantId yet)
+  const nameStatusesRef = useRef(new Map()); // dnLower -> { statusText, statusLevel }
+  const nameTimersRef   = useRef(new Map()); // dnLower -> timeout id
 
   const randNonce = (len=3) => [...crypto.getRandomValues(new Uint8Array(len))].map(b=>b.toString(16).padStart(2,'0')).join('').toUpperCase();
 
-  function scheduleAutoVerifyByPid(pid) {
-    if (!autoVerifyOnJoin) return;
-    const p = participantsRef.current.get(pid);
-    if (!p) return;
-    const now = Date.now();
-    const last = lastAutoRef.current.get(pid) || 0;
-    if (now - last < 2000) return;
-    const t = autoTimersRef.current.get(pid); if (t) clearTimeout(t);
-    const tid = setTimeout(() => {
-      lastAutoRef.current.set(pid, Date.now());
-      sendVerify(pid);
-    }, AUTO_VERIFY_DELAY_MS);
-    autoTimersRef.current.set(pid, tid);
-  }
-
-  // For name-only attendees (no bound device), mark Untrusted after TTL
-  function scheduleNameNoDeviceVerdict(displayName) {
-    const key = (displayName || '').toLowerCase();
-    if (!key) return;
-
-    const old = nameTimersRef.current.get(key);
-    if (old) clearTimeout(old);
-
-    const tid = setTimeout(() => {
-      // ✅ read the CURRENT roster from the ref (not stale state)
-      const entry = meetingRosterRef.current.get(key);
-      const stillUnbound = entry && !entry.participantId;
-      if (stillUnbound) {
-        nameStatusesRef.current.set(key, { statusText: 'Untrusted (no enrolled device)', statusLevel: 'bad' });
-        // force a re-render (participants map change is enough)
-        setParticipants(prev => new Map(prev));
-      }
-    }, DETECT_WINDOW_MS + 300);
-
-    nameTimersRef.current.set(key, tid);
-  }
-
+  // --- helpers
   const setStatus = (p, text, level) => {
     p.statusText = text; p.statusLevel = level;
     const el = document.getElementById(`status-${p.id}`);
@@ -103,10 +65,12 @@ export default function Admin() {
           id: info.id,
           displayName: info.displayName || info.id,
           hasKey: !!info.hasKey,
-          pending: null, pubKey: null,
+          pending: null,
+          pubKey: null,
           statusText: info.hasKey ? 'Enrolled' : 'Unverified',
           statusLevel: info.hasKey ? 'neutral' : 'warn',
-          trustEma: 60
+          trustEma: 60,
+          __queuedSidecar: null,
         };
       } else {
         p.displayName = info.displayName || p.displayName;
@@ -118,6 +82,34 @@ export default function Admin() {
     });
   }
 
+  function scheduleAutoVerify(pid) {
+    if (!autoVerifyOnJoin) return;
+    const p = participantsRef.current.get(pid);
+    if (!p) return;
+    const now = Date.now();
+    const last = lastAutoRef.current.get(pid) || 0;
+    if (now - last < 2000) return;
+    const t = autoTimersRef.current.get(pid); if (t) clearTimeout(t);
+    autoTimersRef.current.set(pid, setTimeout(() => {
+      lastAutoRef.current.set(pid, Date.now());
+      sendVerify(pid);
+    }, AUTO_VERIFY_DELAY_MS));
+  }
+
+  // Mark display name (unbound attendee) as "no key" if nobody binds in time
+  function scheduleNameNoDeviceVerdict(displayName) {
+    const key = (displayName || '').toLowerCase(); if (!key) return;
+    const old = nameTimersRef.current.get(key); if (old) clearTimeout(old);
+    nameTimersRef.current.set(key, setTimeout(() => {
+      const entry = meetingRosterRef.current.get(key);
+      if (entry && !entry.participantId) {
+        nameStatusesRef.current.set(key, { statusText:'Untrusted (no enrolled device)', statusLevel:'bad' });
+        setParticipants(prev => new Map(prev));
+      }
+    }, DETECT_WINDOW_MS + 300));
+  }
+
+  // --- verify flow
   function sendVerify(participantId) {
     const ws = wsRef.current; if (!ws || ws.readyState !== 1) return;
     const p = participantsRef.current.get(participantId); if (!p) return;
@@ -138,7 +130,7 @@ export default function Admin() {
     setTimeout(() => {
       const q = participantsRef.current.get(participantId);
       if (q?.pending && q.pending.n === n) {
-        setStatus(q, 'Unverified (timeout)', 'bad'); bumpRisk(q, false); q.pending = null;
+        setStatus(q, 'Untrusted (timeout)', 'bad'); bumpRisk(q, false); q.pending = null;
       }
     }, DETECT_WINDOW_MS + 250);
   }
@@ -166,7 +158,6 @@ export default function Admin() {
       timedOut = age > DETECT_WINDOW_MS;
     }
 
-    // include quote at the end (must match Companion)
     const canonical = `${sc.meetingId || ''}|${p.id}|${sc.challengeId || ''}|${sc.n}|${sc.ts}|${sc.pattern}|${sc.quote || ''}`;
 
     try {
@@ -177,7 +168,7 @@ export default function Admin() {
         new TextEncoder().encode(canonical)
       );
 
-      // attestation baseline check (learn-on-first-good behavior)
+      // golden-quote baseline
       let attestationOk = true;
       const b = baselineQuotesRef.current.get(p.id);
       if (!b && sc.quote && ok && !timedOut) {
@@ -199,9 +190,7 @@ export default function Admin() {
   }
 
   async function importPemSpki(participantId, pem) {
-    let b64 = pem.replace(/-----BEGIN [^-]+-----/g, '')
-                 .replace(/-----END [^-]+-----/g, '')
-                 .replace(/\s+/g, '');
+    let b64 = pem.replace(/-----BEGIN [^-]+-----/g, '').replace(/-----END [^-]+-----/g, '').replace(/\s+/g, '');
     b64 = b64.replace(/-/g, '+').replace(/_/g, '/'); while (b64.length % 4) b64 += '=';
     const der = Uint8Array.from(atob(b64), c => c.charCodeAt(0)).buffer;
     try {
@@ -210,70 +199,87 @@ export default function Admin() {
         const curr = new Map(prev);
         const p = curr.get(participantId);
         if (p) {
-          p.pubKey = key; p.hasKey = true; p.statusText = 'Enrolled'; p.statusLevel = 'neutral';
+          p.pubKey = key; p.hasKey = true;
+          p.statusText = 'Enrolled'; p.statusLevel = 'neutral';
           if (p.__queuedSidecar) consumeSidecar(p, p.__queuedSidecar);
           curr.set(participantId, p);
         }
         participantsRef.current = curr;
         return curr;
       });
-    } catch {}
+    } catch (e) {
+      console.error('Key import failed', e);
+    }
   }
 
-  // ----- WS -----
+  // --- WS
   useEffect(() => {
     const ws = new WebSocket(import.meta.env.VITE_HUB_URL || 'ws://127.0.0.1:8080'); wsRef.current = ws;
-    ws.onopen = () => { setWsState('Connected'); ws.send(JSON.stringify({ type:'role', role:'verifier' })); };
+    ws.onopen = () => {
+      setWsState('Connected');
+      ws.send(JSON.stringify({ type:'role', role:'verifier' }));
+      setMeetingRoster(new Map()); // clear UI immediately
+      setTimeout(() => {
+        ws.send(JSON.stringify({ type:'reset_meeting', meetingId: meetingIdRef.current }));
+      }, 20);
+      ws.send(JSON.stringify({ type:'participants_request' }));
+
+      setTimeout(() => {
+      ws.send(JSON.stringify({ type:'reset_meeting', meetingId: meetingIdRef.current }));
+      }, 20); // tiny delay so 'role' registers first
+    };
     ws.onclose = () => setWsState('Disconnected');
     ws.onmessage = (ev) => {
       let msg; try { msg = JSON.parse(ev.data); } catch { return; }
-
+      if (msg.type === 'meeting_context' && msg.meetingId) {
+        setMeetingId(String(msg.meetingId));
+      }
       if (msg.type === 'participants') for (const info of msg.list) ensureParticipant(info);
-      if (msg.type === 'participant_join') { ensureParticipant(msg.info); scheduleAutoVerifyByPid(msg.info.id); }
+      if (msg.type === 'participant_join') { ensureParticipant(msg.info); scheduleAutoVerify(msg.info.id); }
+
       if (msg.type === 'participant_leave') {
         setParticipants(prev => { const curr=new Map(prev); curr.delete(msg.participantId); participantsRef.current=curr; return curr; });
       }
-      if (msg.type === 'pubkey_pem') { importPemSpki(msg.participantId, msg.pem); scheduleAutoVerifyByPid(msg.participantId); }
+
+      if (msg.type === 'pubkey_pem') { importPemSpki(msg.participantId, msg.pem); scheduleAutoVerify(msg.participantId); }
       if (msg.type === 'pubkey_clear') setParticipants(prev => {
         const curr = new Map(prev); const p = curr.get(msg.participantId);
         if (p) { p.pubKey=null; p.hasKey=false; p.statusText='Unverified'; p.statusLevel='warn'; }
         participantsRef.current = curr; return curr;
       });
 
+      // Zoom-like roster
       if (msg.type === 'meeting_roster') {
         const m = new Map();
         for (const r of msg.roster) {
           const dnLower = (r.displayName || '').toLowerCase();
           m.set(dnLower, { displayName: r.displayName || '' , participantId: r.participantId || null, present: true });
-
-          // If not bound to a device, schedule local "no enrolled device" verdict
           if (!r.participantId && r.displayName) scheduleNameNoDeviceVerdict(r.displayName);
         }
         setMeetingRoster(m);
-        meetingRosterRef.current = m; // 👈 keep ref in sync
+        meetingRosterRef.current = m;
       }
 
       if (msg.type === 'meeting_presence') {
-        // Build the new map first so we can update both state and ref consistently
         const np = new Map(meetingRosterRef.current);
         const key = (msg.displayName||'').toLowerCase();
         const entry = np.get(key) || { displayName:key, present:true };
         entry.participantId = msg.participantId;
         np.set(key, entry);
         setMeetingRoster(np);
-        meetingRosterRef.current = np; // 👈 keep ref in sync
+        meetingRosterRef.current = np;
 
-        // Binding happened: cancel any pending "no device" timer & clear local red badge
         const t = nameTimersRef.current.get(key);
         if (t) clearTimeout(t);
         nameTimersRef.current.delete(key);
         nameStatusesRef.current.delete(key);
 
-        if (msg.participantId) scheduleAutoVerifyByPid(msg.participantId);
+        if (msg.participantId) scheduleAutoVerify(msg.participantId);
       }
 
       if (msg.type === 'sidecar') {
-        const p = participantsRef.current.get(msg.participantId); if (!p) return;
+        const p = participantsRef.current.get(msg.participantId);
+        if (!p) { console.warn('[Admin] sidecar for unknown participant', msg.participantId); return; }
         consumeSidecar(p, msg.payload);
       }
     };
@@ -281,25 +287,17 @@ export default function Admin() {
     return () => ws.close();
   }, []);
 
-  // derived roster cards + counters
   const rosterItems = [...meetingRoster.values()].map(r => {
     const pid = r.participantId; const p = pid ? participants.get(pid) : null;
-    const present = true;
-
     const nameStatus = nameStatusesRef.current.get((r.displayName||'').toLowerCase());
-    const statusText = pid
-      ? (p?.statusText || (p?.hasKey ? 'Enrolled' : 'Present (no key)'))
-      : (nameStatus?.statusText || 'Present (no key)');
-    const statusLevel = pid
-      ? (p?.statusLevel || (p?.hasKey ? 'neutral' : 'warn'))
-      : (nameStatus?.statusLevel || 'warn');
-
-    return { displayName: r.displayName, pid, p, present, statusText, statusLevel };
+    const statusText = pid ? (p?.statusText || (p?.hasKey ? 'Enrolled' : 'Present (no key)')) : (nameStatus?.statusText || 'Present (no key)');
+    const statusLevel = pid ? (p?.statusLevel || (p?.hasKey ? 'neutral' : 'warn')) : (nameStatus?.statusLevel || 'warn');
+    return { displayName: r.displayName, pid, p, statusText, statusLevel, present:true };
   });
 
-  const totalPresent    = rosterItems.filter(x => x.present).length;
-  const totalTrusted    = rosterItems.filter(x => x.p && x.p.statusLevel === 'ok').length;
-  const totalUnverified = rosterItems.filter(x => x.present && (!x.p || x.p.statusLevel !== 'ok')).length;
+  const totalPresent = rosterItems.length;
+  const totalTrusted = rosterItems.filter(x => x.p && x.p.statusLevel === 'ok').length;
+  const totalUnverified = totalPresent - totalTrusted;
 
   function bindNameToPid(displayName, pid) {
     wsRef.current?.send(JSON.stringify({ type:'bind_attendee', meetingId: meetingIdRef.current, displayName, participantId: pid }));

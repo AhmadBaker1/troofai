@@ -9,9 +9,11 @@
     "hub": "node hub_server.js",
     "service": "node troofai_service.js",
     "zoom-auth": "node zoom_auth_server.js",
-    "enroll": "node enroll_api.js"
+    "enroll": "node enroll_api.js",
+    "ai": "node ai_api_llm.js"
   },
   "dependencies": {
+    "cors": "^2.8.5",
     "dotenv": "^17.2.2",
     "express": "^4.21.2",
     "jsonwebtoken": "^9.0.2",

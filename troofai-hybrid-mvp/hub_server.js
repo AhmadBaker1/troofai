@@ -5,7 +5,9 @@ import crypto from 'crypto';
 
 const PORT = process.env.PORT || 8080;
 const wss = new WebSocketServer({ port: PORT });
+const MEETING_TTL_MS = 2 * 60 * 1000;
 console.log(`[TroofAI Hub] ws://127.0.0.1:${PORT}`);
+
 
 // ---------- persistence ----------
 const KEYS_PATH = './keys.json';
@@ -91,6 +93,32 @@ wss.on('connection', (ws) => {
     if (msg.type === 'role' && msg.role === 'verifier') {
       ws.role = 'verifier'; verifiers.add(ws);
       publishRoster(ws); pushAllKeysTo(ws); sendFullMeetings(ws);
+      return;
+    }
+
+    // --- hard reset a meeting roster (from Admin or ZoomBridge) ---
+    // { type:'reset_meeting', meetingId }
+    if (msg.type === 'reset_meeting') {
+      const mid = String(msg.meetingId || '');
+      if (!mid) return;
+
+      // clear the roster for this meeting and broadcast empty list
+      meetings.set(mid, { roster: new Map(), lastSet: Date.now() });
+      broadcastVerifiers({ type: 'meeting_roster', meetingId: mid, roster: [] });
+      saveState();
+      return;
+    }
+
+    // { type:'meeting_context', meetingId }
+    if (msg.type === 'meeting_context') {
+      const mid = String(msg.meetingId || '');
+      if (!mid) return;
+
+      // remember last context if you want (optional)
+      // then broadcast to ALL clients (verifiers + senders)
+      for (const client of wss.clients) {
+        safeSend(client, { type: 'meeting_context', meetingId: mid });
+      }
       return;
     }
 
@@ -227,4 +255,18 @@ setInterval(() => {
     if (!ws.isAlive) return ws.terminate();
     ws.isAlive = false; try { ws.ping(); } catch {}
   });
+}, 30000);
+
+setInterval(() => {
+  const now = Date.now();
+  let changed = false;
+  for (const [mid, data] of meetings) {
+    // if the roster hasn't been updated recently, clear it
+    if ((now - (data.lastSet || 0)) > MEETING_TTL_MS) {
+      meetings.set(mid, { roster: new Map(), lastSet: now });
+      broadcastVerifiers({ type: 'meeting_roster', meetingId: mid, roster: [] });
+      changed = true;
+    }
+  }
+  if (changed) saveState();
 }, 30000);
